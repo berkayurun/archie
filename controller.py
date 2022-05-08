@@ -24,6 +24,7 @@ from pathlib import Path
 import pickle
 import subprocess
 import sys
+import tables
 import time
 
 import pandas as pd
@@ -255,6 +256,7 @@ def controller(
     goldenrun_only,
     istart,
     iend,
+    missing_only,
     goldenrun=True,
     logger=hdf5collector,
     qemu_pre=None,
@@ -309,6 +311,63 @@ def controller(
 
     if istart != -1:
         faultlist = faultlist[istart:]
+
+    # Remove already simulated faults
+    if missing_only:
+        clogger.info("Identifying already simulated faults")
+
+        hdf5_file = Path(hdf5path)
+        if hdf5_file.is_file():
+            # Collect list of simulated faults
+            existing_faults = []
+
+            with tables.open_file(hdf5path, "r") as f_in:
+                for group in f_in.walk_groups("/fault"):
+                    if group._v_depth != 2:
+                        continue
+
+                    fault_entry = group.faults
+
+                    assert len(fault_entry) == 1
+
+                    fa = fault_entry[0]["fault_address"]
+                    ta = fault_entry[0]["trigger_address"]
+                    th = fault_entry[0]["trigger_hitcounter"]
+                    nb = fault_entry[0]["fault_num_bytes"]
+
+                    fault_str = f"{fa:x}_{ta:x}_{th}_{nb}"
+
+                    if fault_str not in existing_faults:
+                        existing_faults.append(fault_str)
+
+            clogger.info(f"Found {len(existing_faults)} unique existing faults")
+
+            # Filter faultlist to remove already simulated faults
+            new_faultlist = []
+
+            for fault_entry in faultlist:
+                assert len(fault_entry["faultlist"]) == 1
+
+                fa = fault_entry["faultlist"][0].address
+                ta = fault_entry["faultlist"][0].trigger.address
+                th = fault_entry["faultlist"][0].trigger.hitcounter
+                nb = fault_entry["faultlist"][0].num_bytes
+
+                fault_str = f"{fa:x}_{ta:x}_{th}_{nb}"
+
+                if fault_str not in existing_faults:
+                    new_faultlist.append(fault_entry)
+
+            clogger.info(
+                f"Identified {len(faultlist) - len(new_faultlist)} already "
+                f"simulated faults, {len(new_faultlist)} remain"
+            )
+
+            faultlist = new_faultlist
+        else:
+            clogger.info(
+                f"Identified no already simulated faults, {len(faultlist)} remain"
+            )
 
     p_logger = Process(
         target=logger,
@@ -549,6 +608,13 @@ def get_argument_parser():
         required=False,
         default=-1,
     )
+    parser.add_argument(
+        "--missing-only",
+        "-m",
+        help="Only run missing experiments",
+        action="store_true",
+        required=False,
+    )
     return parser
 
 
@@ -593,6 +659,12 @@ def process_arguments(args):
 
     parguments["istart"] = args.istart
     parguments["iend"] = args.iend
+    if args.missing_only:
+        parguments["missing_only"] = True
+        parguments["hdf5mode"] = "a"
+        parguments["goldenrun"] = False
+    else:
+        parguments["missing_only"] = False
 
     qemu_conf = json.load(args.qemu)
     args.qemu.close()
@@ -705,6 +777,7 @@ if __name__ == "__main__":
         parguments["goldenrun_only"],
         parguments["istart"],
         parguments["iend"],
+        parguments["missing_only"],
         parguments["goldenrun"],  # goldenrun
         hdf5collector,  # logger
         None,  # qemu_pre
