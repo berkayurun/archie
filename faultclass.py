@@ -825,7 +825,6 @@ def python_worker(
         )
         p_qemu.join()
         delete_fifos()
-
         logger.debug(
             "Python worker for experiment {} done. Took {}s, mem usage {}KiB".format(
                 index, time.time() - t0, mem

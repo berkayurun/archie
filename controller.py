@@ -17,13 +17,14 @@
 # limitations under the License.
 
 import argparse
+import copy
+import hashlib
 import logging
-import lzma
 from multiprocessing import Manager, Process
 from pathlib import Path
-import pickle
 import subprocess
 import sys
+import tables
 import time
 
 import pandas as pd
@@ -41,6 +42,7 @@ except ModuleNotFoundError:
 
 from faultclass import detect_type, detect_model, Fault, Trigger
 from faultclass import python_worker
+from faultclass import Register
 from hdf5logger import hdf5collector
 from goldenrun import run_goldenrun
 
@@ -243,15 +245,256 @@ def get_system_ram():
     return mem
 
 
+def create_backup(args, queue_output, config_qemu, raw_faultlist, expanded_faultlist):
+    """
+    Creates a backup dict with hashes and pushes it to the given queue
+
+    :param args: parameters of the program
+    :param queue_output: queue to push the created backup
+    :param config_qemu: qemu.json config dictionary
+    :param raw_faultlist: list of raw faults from the json file
+    :param expanded_faultlist: list of expanded faults
+    :return: void
+    """
+    filenames = [
+        args.qemu.name,
+        args.faults.name,
+        config_qemu["kernel"],
+        config_qemu["bios"],
+    ]
+
+    hasher = hashlib.md5()
+    for fn in filenames:
+        if Path(fn).is_file():
+            hasher.update(Path(fn).read_bytes())
+        else:
+            clogger.debug("Empty file path during backup hash")
+
+    config_qemu["hash"] = hasher.digest()
+    backup = {
+        "index": -3,
+        "config": config_qemu,
+        "raw_faultlist": raw_faultlist,
+        "expanded_faultlist": expanded_faultlist,
+    }
+
+    queue_output.put(backup)
+
+
+def read_backup(hdf5_file):
+    """
+    :param hdf5_file: path to hdf5
+    :return: backup_raw_faults, backup_expanded_faults, backup_config, backup_goldenrun
+    """
+    with tables.open_file(hdf5_file, "r") as f_in:
+        # Process start points
+        startpoints = []
+        for startpoint in f_in.root.Backup.start_addresses:
+            startpoints.append(
+                {"address": startpoint["address"], "counter": startpoint["counter"]}
+            )
+
+        # Process end points
+        endpoints = []
+        for endpoint in f_in.root.Backup.end_addresses:
+            endpoints.append(
+                {"address": endpoint["address"], "counter": endpoint["counter"]}
+            )
+
+        # Process config
+        assert len(f_in.root.Backup.parameters) == 1
+        hdf5_flags = f_in.root.Backup.parameters.read()
+        backup_config = {
+            "qemu": hdf5_flags["qemu"][0].decode("utf-8"),
+            "kernel": hdf5_flags["kernel"][0].decode("utf-8"),
+            "plugin": hdf5_flags["plugin"][0].decode("utf-8"),
+            "machine": hdf5_flags["machine"][0].decode("utf-8"),
+            "additional_qemu_args": hdf5_flags["additional_qemu_args"][0].decode(
+                "utf-8"
+            ),
+            "bios": hdf5_flags["bios"][0].decode("utf-8"),
+            "ring_buffer": bool(hdf5_flags["ring_buffer"][0]),
+            "tb_exec_list": bool(hdf5_flags["tb_exec_list"][0]),
+            "tb_info": bool(hdf5_flags["tb_info"][0]),
+            "mem_info": bool(hdf5_flags["mem_info"][0]),
+            "max_instruction_count": hdf5_flags["max_instruction_count"][0],
+            "start": startpoints[0],
+            "end": endpoints,
+            "arch": hdf5_flags["arch"][0].decode("utf-8"),
+            "hash": hdf5_flags["hash"][0],
+        }
+
+        # Process goldenrun data
+        backup_goldenrun = {"index": -1}
+
+        goldenrun_faultlist = []
+        for fault in f_in.root.Goldenrun.faults.iterrows():
+            new_fault = Fault(
+                fault["fault_address"],
+                [],
+                fault["fault_type"],
+                fault["fault_model"],
+                fault["fault_lifespan"],
+                fault["fault_mask"],
+                fault["trigger_address"],
+                fault["trigger_hitcounter"],
+                fault["fault_num_bytes"],
+                False,
+            )
+
+            goldenrun_faultlist.append(new_fault)
+
+        backup_goldenrun["faultlist"] = goldenrun_faultlist
+
+        tb_info_list = []
+        for tb_info in f_in.root.Goldenrun.tbinfo.iterrows():
+            tb_info_list.append(
+                {
+                    "assembler": tb_info["assembler"].decode("utf-8"),
+                    "identity": tb_info["identity"],
+                    "ins_count": tb_info["ins_count"],
+                    "num_exec": tb_info["num_exec"],
+                    "size": tb_info["size"],
+                }
+            )
+        backup_goldenrun["tbinfo"] = tb_info_list
+
+        tb_exec_list = []
+        for tb_exec in f_in.root.Goldenrun.tbexeclist.iterrows():
+            tb_exec_list.append({"pos": tb_exec["pos"], "tb": tb_exec["tb"]})
+        backup_goldenrun["tbexec"] = tb_exec_list
+
+        if backup_config["mem_info"]:
+            mem_info = []
+            for mem in f_in.root.Goldenrun.meminfo.iterrows():
+                mem_info.append(
+                    {
+                        "address": mem["address"],
+                        "counter": mem["counter"],
+                        "direction": mem["direction"],
+                        "insaddr": mem["insaddr"],
+                        "size": mem["size"],
+                        "tbid": mem["tbid"],
+                    }
+                )
+            backup_goldenrun["meminfo"] = mem_info
+
+        # Process goldenrun registers
+        register_list = []
+
+        if backup_config["arch"] == "riscv":
+            register_type = Register.RISCV
+            reg_size = 32
+            reg_name = "x"
+            rows = f_in.root.Goldenrun.riscvregisters.iterrows()
+        elif backup_config["arch"] == "arm":
+            register_type = Register.ARM
+            reg_size = 16
+            reg_name = "r"
+            rows = f_in.root.Goldenrun.armregisters.iterrows()
+
+        for reg in rows:
+            registers = {"pc": reg["pc"], "tbcounter": reg["tbcounter"]}
+            for i in range(0, reg_size):
+                registers[f"{reg_name}{i}"] = reg[f"{reg_name}{i}"]
+
+            # Last element of register_values is XPSR for Arm, PC for RISCV
+            if register_type == Register.ARM:
+                registers["xpsr"] = reg[f"{reg_name}{reg_size}"]
+            elif register_type == Register.RISCV:
+                registers[f"{reg_name}{reg_size}"] = reg[f"{reg_name}{reg_size}"]
+
+            register_list.append(registers)
+
+        backup_goldenrun["riscvregisters"] = register_list
+
+        # Process unexpanded raw faults
+        backup_raw_faults = []
+        exp_n = 0
+        for exp in f_in.root.Backup.input_faults:
+            backup_exp = {"index": exp_n}
+            exp_faultlist = []
+            for fault in exp.faults.iterrows():
+                if fault["fault_wildcard"].decode("utf-8") == "True":
+                    wildcard = True
+                else:
+                    wildcard = False
+                exp_faultlist.append(
+                    Fault(
+                        fault["fault_address"],
+                        0,
+                        fault["fault_type"],
+                        fault["fault_model"],
+                        fault["fault_lifespan"],
+                        fault["fault_mask"],
+                        fault["trigger_address"],
+                        fault["trigger_hitcounter"],
+                        fault["fault_num_bytes"],
+                        wildcard,
+                    )
+                )
+            backup_exp["faultlist"] = exp_faultlist
+            exp_n = exp_n + 1
+            backup_raw_faults.append(backup_exp)
+
+        # Process expanded faults
+        backup_expanded_faults = []
+        exp_n = 0
+        for exp in f_in.root.Backup.expanded_faults:
+            backup_exp = {"index": exp_n}
+            exp_faultlist = []
+            for fault in exp.faults.iterrows():
+                if fault["fault_wildcard"].decode("utf-8") == "True":
+                    wildcard = True
+                else:
+                    wildcard = False
+                exp_faultlist.append(
+                    Fault(
+                        fault["fault_address"],
+                        0,
+                        fault["fault_type"],
+                        fault["fault_model"],
+                        fault["fault_lifespan"],
+                        fault["fault_mask"],
+                        fault["trigger_address"],
+                        fault["trigger_hitcounter"],
+                        fault["fault_num_bytes"],
+                        wildcard,
+                    )
+                )
+            backup_exp["faultlist"] = exp_faultlist
+            exp_n = exp_n + 1
+            backup_expanded_faults.append(backup_exp)
+
+    return [backup_raw_faults, backup_expanded_faults, backup_config, backup_goldenrun]
+
+
+def check_backup(args, current_config, backup_config):
+    filenames = [
+        args.qemu.name,
+        args.faults.name,
+        current_config["kernel"],
+        current_config["bios"],
+    ]
+
+    hasher = hashlib.md5()
+    for fn in filenames:
+        if Path(fn).is_file():
+            hasher.update(Path(fn).read_bytes())
+        else:
+            clogger.debug("Empty file path during backup hash")
+
+    return backup_config["hash"] == hasher.digest()
+
+
 def controller(
-    hdf5path,
+    args,
     hdf5mode,
     faultlist,
     config_qemu,
     num_workers,
     queuedepth,
     compressionlevel,
-    qemu_output,
     goldenrun=True,
     logger=hdf5collector,
     qemu_pre=None,
@@ -267,6 +510,9 @@ def controller(
 
     t0 = time.time()
 
+    hdf5path = args.hdf5file
+    qemu_output = args.debug
+
     m = Manager()
     m2 = Manager()
     queue_output = m.Queue()
@@ -275,10 +521,56 @@ def controller(
     prctl.set_name("Controller")
     prctl.set_proctitle("Python_Controller")
 
-    # Storing and restoring goldenrun_data with pickle is a temporary fix
-    # A better solution is to parse the goldenrun_data from the existing hdf5 file
+    print_config = True
+    print_goldenrun = True
+    print_fault = True
+    overwrite_faults = False
+
     goldenrun_data = {}
+
+    hdf5_file = Path(hdf5path)
+    if hdf5_file.is_file():
+        clogger.info("HDF5 file already exits")
+        [
+            backup_raw_faultlist,
+            backup_expanded_faultlist,
+            backup_config,
+            backup_goldenrun_data,
+        ] = read_backup(hdf5_file)
+
+        clogger.info("Checking the backup")
+        if check_backup(args, config_qemu, backup_config):
+            clogger.info("Backup matched and will be used")
+
+            faultlist = backup_expanded_faultlist
+            config_qemu["max_instruction_count"] = backup_config[
+                "max_instruction_count"
+            ]
+            goldenrun_data = backup_goldenrun_data
+
+            goldenrun = False
+            print_fault = True
+            print_goldenrun = False
+            print_config = False
+            hdf5mode = "a"
+
+            if not args.append:
+                overwrite_faults = True
+        else:
+            clogger.warning("Backup does not match, running goldenrun!")
+            goldenrun = True
+
+            print_fault = True
+            print_config = True
+            print_goldenrun = True
+
+            if hdf5mode == "a":
+                print_config = False
+                print_goldenrun = False
+
     if goldenrun:
+        raw_faultlist = copy.deepcopy(faultlist)
+
         [
             config_qemu["max_instruction_count"],
             goldenrun_data,
@@ -286,16 +578,11 @@ def controller(
         ] = run_goldenrun(
             config_qemu, qemu_output, queue_output, faultlist, qemu_pre, qemu_post
         )
-        pickle.dump(
-            (config_qemu["max_instruction_count"], goldenrun_data, faultlist),
-            lzma.open("bkup_goldenrun_results.xz", "wb"),
-        )
+
+        create_backup(args, queue_output, config_qemu, raw_faultlist, faultlist)
     else:
-        (
-            config_qemu["max_instruction_count"],
-            goldenrun_data,
-            faultlist,
-        ) = pickle.load(lzma.open("bkup_goldenrun_results.xz", "rb"))
+        print_config = False
+        print_goldenrun = False
 
     p_logger = Process(
         target=logger,
@@ -306,6 +593,10 @@ def controller(
             len(faultlist),
             compressionlevel,
             logger_postprocess,
+            print_fault,
+            print_config,
+            print_goldenrun,
+            overwrite_faults,
         ),
     )
 
@@ -650,14 +941,13 @@ if __name__ == "__main__":
     init_logging()
 
     controller(
-        args.hdf5file,  # hdf5path
+        args,
         parguments["hdf5mode"],  # hdf5mode
         parguments["faultlist"],  # faultlist
         parguments["qemu_conf"],  # config_qemu
         parguments["num_workers"],  # num_workers
         parguments["queuedepth"],  # queuedepth
         parguments["compressionlevel"],  # compressionlevel
-        args.debug,  # qemu_output
         parguments["goldenrun"],  # goldenrun
         hdf5collector,  # logger
         None,  # qemu_pre
