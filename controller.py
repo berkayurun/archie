@@ -41,7 +41,7 @@ except ModuleNotFoundError:
     pass
 
 from faultclass import detect_type, detect_model, Fault, Trigger
-from faultclass import python_worker
+from faultclass import python_worker, compare_faultlist
 from faultclass import Register
 from hdf5logger import hdf5collector
 from goldenrun import run_goldenrun
@@ -258,7 +258,6 @@ def create_backup(args, queue_output, config_qemu, raw_faultlist, expanded_fault
     """
     filenames = [
         args.qemu.name,
-        args.faults.name,
         config_qemu["kernel"],
         config_qemu["bios"],
     ]
@@ -318,6 +317,7 @@ def read_backup(hdf5_file):
             "tb_info": bool(hdf5_flags["tb_info"][0]),
             "mem_info": bool(hdf5_flags["mem_info"][0]),
             "max_instruction_count": hdf5_flags["max_instruction_count"][0],
+            "max_instruction_count_before_goldenrun": hdf5_flags["max_instruction_count_before_goldenrun"][0],
             "start": startpoints[0],
             "end": endpoints,
             "arch": hdf5_flags["arch"][0].decode("utf-8"),
@@ -443,7 +443,7 @@ def read_backup(hdf5_file):
         for exp in tqdm(
             f_in.root.Backup.expanded_faults,
             total=f_in.root.Backup.expanded_faults._v_nchildren,
-            desc="Reading backup",
+            desc="Reading expanded faults",
         ):
             backup_exp = {"index": exp_n}
             exp_faultlist = []
@@ -470,13 +470,70 @@ def read_backup(hdf5_file):
             exp_n = exp_n + 1
             backup_expanded_faults.append(backup_exp)
 
-    return [backup_raw_faults, backup_expanded_faults, backup_config, backup_goldenrun]
+        # Process simulated faults
+        backup_simulated_faults = []
+        exp_n = 0
+        for exp in tqdm(
+            f_in.root.fault,
+            total=f_in.root.fault._v_nchildren,
+            desc="Reading simulated faults",
+        ):
+            backup_exp = {"index": exp_n}
+            exp_faultlist = []
+            for fault in exp.faults.iterrows():
+                if fault["fault_wildcard"].decode("utf-8") == "True":
+                    wildcard = True
+                else:
+                    wildcard = False
+                exp_faultlist.append(
+                    Fault(
+                        fault["fault_address"],
+                        0,
+                        fault["fault_type"],
+                        fault["fault_model"],
+                        fault["fault_lifespan"],
+                        fault["fault_mask"],
+                        fault["trigger_address"],
+                        fault["trigger_hitcounter"],
+                        fault["fault_num_bytes"],
+                        wildcard,
+                    )
+                )
+            backup_exp["faultlist"] = exp_faultlist
+            exp_n = exp_n + 1
+            backup_simulated_faults.append(backup_exp)
+
+    return [backup_simulated_faults, backup_raw_faults, backup_expanded_faults, backup_config, backup_goldenrun]
 
 
 def check_backup(args, current_config, backup_config):
+    parameters = [
+        "ring_buffer",
+        "tb_exec_list",
+        "tb_info",
+        "mem_info",
+        "max_instruction_count_before_goldenrun",
+        "start",
+        "end",
+    ]
+
+    # Compare config.json
+    for param in parameters:
+        if param == "end":
+            if len(backup_config[param]) != len(current_config[param]):
+                return False
+            for point in backup_config[param]:
+                if point not in current_config[param]:
+                    return False
+        elif param == "max_instruction_count_before_goldenrun":
+            if backup_config[param] != current_config["max_instruction_count"]:
+                return False
+        elif current_config[param] != backup_config[param]:
+            return False
+
+    # Compare rest of the files
     filenames = [
         args.qemu.name,
-        args.faults.name,
         current_config["kernel"],
         current_config["bios"],
     ]
@@ -489,6 +546,17 @@ def check_backup(args, current_config, backup_config):
             clogger.debug("Empty file path during backup hash")
 
     return backup_config["hash"] == hasher.digest()
+
+
+def get_missing_faults(faultlist, backup_simulated_faultlist):
+    match = []
+    for exp_i in faultlist:
+        for exp_j in backup_simulated_faultlist:
+            if compare_faultlist(exp_i["faultlist"], exp_j["faultlist"]):
+                match.append(exp_i)
+
+    missing = [fault for fault in faultlist if fault not in match]
+    return missing
 
 
 def controller(
@@ -531,11 +599,13 @@ def controller(
     overwrite_faults = False
 
     goldenrun_data = {}
+    backup_simulated_faults = []
 
     hdf5_file = Path(hdf5path)
     if hdf5_file.is_file():
         clogger.info("HDF5 file already exits")
         [
+            backup_simulated_faults,
             backup_raw_faultlist,
             backup_expanded_faultlist,
             backup_config,
@@ -546,7 +616,9 @@ def controller(
         if check_backup(args, config_qemu, backup_config):
             clogger.info("Backup matched and will be used")
 
-            faultlist = backup_expanded_faultlist
+            if not args.missing_only:
+                faultlist = backup_expanded_faultlist
+
             config_qemu["max_instruction_count"] = backup_config[
                 "max_instruction_count"
             ]
@@ -558,23 +630,18 @@ def controller(
             print_config = False
             hdf5mode = "a"
 
-            if not args.append:
+            if not args.append and not args.missing_only:
                 overwrite_faults = True
         else:
-            clogger.warning("Backup does not match, running goldenrun!")
-            goldenrun = True
-
-            print_fault = True
-            print_config = True
-            print_goldenrun = True
-
-            if hdf5mode == "a":
-                print_config = False
-                print_goldenrun = False
+            clogger.warning(
+                "Backup does not match, run with overwrite flag to overwrite!"
+            )
+            return config_qemu
 
     if goldenrun:
         raw_faultlist = copy.deepcopy(faultlist)
 
+        config_qemu["max_instruction_count_before_goldenrun"] = config_qemu["max_instruction_count"]
         [
             config_qemu["max_instruction_count"],
             goldenrun_data,
@@ -587,6 +654,10 @@ def controller(
     else:
         print_config = False
         print_goldenrun = False
+
+    if args.missing_only and backup_simulated_faults:
+        faultlist = get_missing_faults(faultlist, backup_simulated_faults)
+        clogger.info(f"Missing {len(faultlist)} faults.")
 
     p_logger = Process(
         target=logger,
@@ -626,7 +697,7 @@ def controller(
             continue
         goldenrun_data[keyword] = pd.DataFrame(goldenrun_data[keyword])
 
-    pbar = tqdm(total=len(faultlist), desc="Simulating faults")
+    pbar = tqdm(total=len(faultlist), desc="Simulating faults", disable=False if faultlist else True)
     itter = 0
     while 1:
         if len(p_list) == 0 and itter == len(faultlist):
@@ -725,7 +796,10 @@ def controller(
         "Took {}:{}:{} to complete all experiments".format(int(h), int(m), int(s))
     )
 
-    tperindex = (t1 - t0) / len(faultlist)
+    if faultlist:
+        tperindex = (t1 - t0) / len(faultlist)
+    else:
+        tperindex = t1 - t0
     tperworker = tperindex / num_workers
     clogger.debug(
         "Took average of {}s per fault, python worker rough runtime is {}s".format(
@@ -808,6 +882,13 @@ def get_argument_parser():
         action="store_true",
         required=False,
     )
+    parser.add_argument(
+        "--missing-only",
+        "-m",
+        help="Only run missing experiments",
+        action="store_true",
+        required=False
+    )
     return parser
 
 
@@ -843,6 +924,13 @@ def process_arguments(args):
             f"{hdf5file.parent}"
         )
         exit(1)
+
+    if args.missing_only:
+        parguments["missing_only"] = True
+        parguments["hdf5mode"] = "a"
+        parguments["goldenrun"] = False
+    else:
+        parguments["missing_only"] = False
 
     qemu_conf = json.load(args.qemu)
     args.qemu.close()

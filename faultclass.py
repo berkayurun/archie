@@ -124,6 +124,37 @@ class Fault:
         self.wildcard = wildcard
 
 
+def compare_fault(f1, f2):
+    if f1.trigger.address != f2.trigger.address:
+        return False
+    if f1.trigger.hitcounter != f2.trigger.hitcounter:
+        return False
+    if f1.address != f2.address:
+        return False
+    if f1.type != f2.type:
+        return False
+    if f1.model != f2.model:
+        return False
+    if f1.lifespan != f2.lifespan:
+        return False
+    if f1.mask != f2.mask:
+        return False
+    if f1.num_bytes != f2.num_bytes:
+        return False
+    if f1.wildcard != f2.wildcard:
+        return False
+    return True
+
+
+def compare_faultlist(listA, listB):
+    match = []
+    for faultA in listA:
+        for faultB in listB:
+            if compare_fault(faultA, faultB):
+                match.append(faultA)
+    return len(match) == len(listA)
+
+
 def write_fault_list_to_pipe(fault_list, fifo):
     fault_pack = fault_pb2.FaultPack()
 

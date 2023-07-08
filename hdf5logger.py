@@ -145,6 +145,7 @@ class config_table(tables.IsDescription):
     tb_info = tables.BoolCol()
     mem_info = tables.BoolCol()
     max_instruction_count = tables.UInt64Col()
+    max_instruction_count_before_goldenrun = tables.UInt64Col()
     memory_dump = tables.BoolCol()
     hash = tables.StringCol(16)
 
@@ -361,6 +362,7 @@ def process_config(f, configgroup, exp, myfilter):
     config_row["tb_info"] = exp["tb_info"]
     config_row["mem_info"] = exp["mem_info"]
     config_row["max_instruction_count"] = exp["max_instruction_count"]
+    config_row["max_instruction_count_before_goldenrun"] = exp["max_instruction_count_before_goldenrun"]
     config_row["hash"] = exp["hash"]
 
     if "riscv" in exp["qemu"]:
