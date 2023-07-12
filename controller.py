@@ -42,7 +42,7 @@ except ModuleNotFoundError:
 
 from faultclass import detect_type, detect_model, Fault, Trigger
 from faultclass import python_worker, compare_faultlist
-from faultclass import Register
+from faultclass import Register, Experiment
 from hdf5logger import hdf5collector
 from goldenrun import run_goldenrun
 
@@ -549,13 +549,19 @@ def check_backup(args, current_config, backup_config):
 
 
 def get_missing_faults(faultlist, backup_simulated_faultlist):
-    match = []
-    for exp_i in faultlist:
-        for exp_j in backup_simulated_faultlist:
-            if compare_faultlist(exp_i["faultlist"], exp_j["faultlist"]):
-                match.append(exp_i)
+    backup_experiments = []
+    input_experiments = []
+    missing = []
+    for exp in faultlist:
+        input_experiments.append(Experiment(exp["faultlist"], exp["index"], False))
 
-    missing = [fault for fault in faultlist if fault not in match]
+    for exp in backup_simulated_faultlist:
+        backup_experiments.append(Experiment(exp["faultlist"], exp["index"], False))
+
+    for exp in input_experiments:
+        if exp not in backup_experiments:
+            missing.append({"index": exp.index, "faultlist": exp.faultlist, "delete": exp.delete})
+
     return missing
 
 

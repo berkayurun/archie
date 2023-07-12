@@ -123,36 +123,69 @@ class Fault:
         self.num_bytes = num_bytes
         self.wildcard = wildcard
 
+    def __eq__(self, other):
+        if type(other) is not type(self):
+            return False
+        if self.trigger.address != other.trigger.address:
+            return False
+        if self.trigger.hitcounter != other.trigger.hitcounter:
+            return False
+        if self.address != other.address:
+            return False
+        if self.type != other.type:
+            return False
+        if self.model != other.model:
+            return False
+        if self.lifespan != other.lifespan:
+            return False
+        if self.mask != other.mask:
+            return False
+        if self.num_bytes != other.num_bytes:
+            return False
+        if self.wildcard != other.wildcard:
+            return False
+        return True
 
-def compare_fault(f1, f2):
-    if f1.trigger.address != f2.trigger.address:
-        return False
-    if f1.trigger.hitcounter != f2.trigger.hitcounter:
-        return False
-    if f1.address != f2.address:
-        return False
-    if f1.type != f2.type:
-        return False
-    if f1.model != f2.model:
-        return False
-    if f1.lifespan != f2.lifespan:
-        return False
-    if f1.mask != f2.mask:
-        return False
-    if f1.num_bytes != f2.num_bytes:
-        return False
-    if f1.wildcard != f2.wildcard:
-        return False
-    return True
+    def __hash__(self):
+        atr = (
+            self.trigger.address,
+            self.trigger.hitcounter,
+            self.address,
+            self.type,
+            self.model,
+            self.lifespan,
+            self.mask,
+            self.num_bytes,
+        )
+        return hash(atr)
 
+
+class Experiment:
+    def __init__(
+        self,
+        faultlist: list,
+        index: int,
+        delete: int,
+    ):
+        """
+        Define attributes for experiment
+        """
+        self.faultlist = faultlist
+        self.index = index
+        self.delete = delete
+
+    def __eq__(self, other):
+        if type(other) is not type(self):
+            return False
+        if set(self.faultlist) == set(other.faultlist):
+            return True
+        return False
+
+    def __hash__(self):
+        return hash(tuple(self.faultlist))
 
 def compare_faultlist(listA, listB):
-    match = []
-    for faultA in listA:
-        for faultB in listB:
-            if compare_fault(faultA, faultB):
-                match.append(faultA)
-    return len(match) == len(listA)
+    return set(listA) == set(listB)
 
 
 def write_fault_list_to_pipe(fault_list, fifo):
